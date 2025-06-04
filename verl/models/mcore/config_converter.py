@@ -186,6 +186,7 @@ def hf_to_mcore_config_qwen3moe(hf_config: PretrainedConfig, dtype: torch.dtype,
 
 def hf_to_mcore_config_dpskv3(hf_config: PretrainedConfig, dtype: torch.dtype, **override_transformer_config_kwargs) -> MLATransformerConfig:
     # DeepseekV3ForCausalLM
+    from megatron.core import parallel_state as mpu
     from megatron.core.transformer.enums import AttnBackend
 
     from .patch_v012 import apply_patch
@@ -207,59 +208,83 @@ def hf_to_mcore_config_dpskv3(hf_config: PretrainedConfig, dtype: torch.dtype, *
     for i in range(hf_config.first_k_dense_replace):
         moe_layer_freq[i] = 0
 
-    args = _get_base_transformer_config(
-        hf_config=hf_config,
-        dtype=dtype,
-        use_cpu_initialization=False,
-        add_bias_linear=False,
-        attention_backend=AttnBackend.fused,
-        bf16=dtype is torch.bfloat16,
-        layernorm_epsilon=hf_config.rms_norm_eps,
-        ffn_hidden_size=hf_config.intermediate_size,
-        qk_layernorm=True,
-        # moe specific
-        moe_ffn_hidden_size=hf_config.moe_intermediate_size,
-        moe_token_dispatcher_type="alltoall",
-        moe_router_bias_update_rate=0.001,
-        moe_router_enable_expert_bias=True,
-        moe_router_topk=hf_config.num_experts_per_tok,
-        num_moe_experts=hf_config.n_routed_experts,
-        moe_shared_expert_intermediate_size=hf_config.moe_intermediate_size * hf_config.n_shared_experts,
-        moe_aux_loss_coeff=getattr(hf_config, "aux_loss_alpha", 0.001),
-        moe_router_load_balancing_type="seq_aux_loss",
-        moe_shared_expert_overlap=True,
-        # moe_permute_fusion=True, # need TE 2.1+
-        moe_grouped_gemm=True,
-        moe_router_score_function="sigmoid",
-        moe_router_pre_softmax=True,
-        moe_router_topk_scaling_factor=hf_config.routed_scaling_factor,
-        moe_layer_freq=moe_layer_freq,
-        # MLA
-        q_lora_rank=hf_config.q_lora_rank,
-        kv_lora_rank=hf_config.kv_lora_rank,
-        qk_head_dim=hf_config.qk_nope_head_dim,
-        qk_pos_emb_head_dim=hf_config.qk_rope_head_dim,
-        v_head_dim=hf_config.v_head_dim,
-        rotary_base=hf_config.rope_theta,
-        rotary_scaling_factor=mla_rope_config["factor"],
-        rope_type=mla_rope_config["type"],
-        mscale=mla_rope_config["mscale"],
-        mscale_all_dim=mla_rope_config["mscale_all_dim"],
-        max_position_embeddings=mla_rope_config["original_max_position_embeddings"],
-        beta_fast=mla_rope_config["beta_fast"],
-        beta_slow=mla_rope_config["beta_slow"],
-        # mcore 0.12 moe
-        moe_router_dtype="fp64",
-        disable_bf16_reduced_precision_matmul=True,
-        # other
-        # deallocate_pipeline_outputs=True,
-        # gradient_accumulation_fusion=True,
-        persist_layer_norm=True,
-        bias_activation_fusion=True,
-        bias_dropout_fusion=True,
-        **override_transformer_config_kwargs,
-    )
-    transformer_config = MLATransformerConfig(**args)
+    # Common parallel state parameters
+    overlap_p2p_comm = mpu.get_virtual_pipeline_model_parallel_world_size() is not None and mpu.get_virtual_pipeline_model_parallel_world_size() > 1
+    batch_p2p_comm = False
+
+    # Create MLATransformerConfig directly with all parameters
+    config_args = {
+        # Model architecture parameters
+        "num_layers": hf_config.num_hidden_layers,
+        "hidden_size": hf_config.hidden_size,
+        "num_attention_heads": hf_config.num_attention_heads,
+        "num_query_groups": hf_config.num_key_value_heads,
+        "ffn_hidden_size": hf_config.intermediate_size,
+        "attention_dropout": hf_config.attention_dropout,
+        "hidden_dropout": getattr(hf_config, "hidden_dropout", 0.0),
+        "kv_channels": getattr(hf_config, "head_dim", None),
+        "layernorm_epsilon": hf_config.rms_norm_eps,
+        # Activation and normalization
+        "activation_func": F.silu,
+        "normalization": "RMSNorm",
+        "gated_linear_unit": True,
+        # Data types
+        "pipeline_dtype": dtype,
+        "params_dtype": dtype,
+        "bf16": dtype is torch.bfloat16,
+        # Parallel configuration
+        "tensor_model_parallel_size": mpu.get_tensor_model_parallel_world_size(),
+        "pipeline_model_parallel_size": mpu.get_pipeline_model_parallel_world_size(),
+        "expert_model_parallel_size": mpu.get_expert_model_parallel_world_size(),
+        "expert_tensor_parallel_size": mpu.get_expert_tensor_parallel_world_size(),
+        "virtual_pipeline_model_parallel_size": mpu.get_virtual_pipeline_model_parallel_world_size(),
+        "context_parallel_size": mpu.get_context_parallel_world_size(),
+        "overlap_p2p_comm": overlap_p2p_comm,
+        "batch_p2p_comm": batch_p2p_comm,
+        "sequence_parallel": mpu.get_tensor_model_parallel_world_size() > 1,
+        # Common settings
+        "variable_seq_lengths": True,
+        "masked_softmax_fusion": True,
+        "moe_token_dispatcher_type": "alltoall",
+        # Additional parameters
+        "use_cpu_initialization": False,
+        "add_bias_linear": False,
+        "attention_backend": AttnBackend.fused,
+        "qk_layernorm": True,
+        # Standard MoE parameters
+        "num_moe_experts": hf_config.n_routed_experts,
+        "moe_router_topk": hf_config.num_experts_per_tok,
+        "moe_shared_expert_intermediate_size": hf_config.moe_intermediate_size * hf_config.n_shared_experts,
+        "moe_aux_loss_coeff": getattr(hf_config, "aux_loss_alpha", 0.001),
+        "moe_router_load_balancing_type": "aux_loss",
+        "moe_shared_expert_overlap": True,
+        "moe_grouped_gemm": True,
+        "moe_router_score_function": "softmax",
+        "moe_router_pre_softmax": True,
+        # MLA specific parameters
+        "q_lora_rank": hf_config.q_lora_rank,
+        "kv_lora_rank": hf_config.kv_lora_rank,
+        "qk_head_dim": hf_config.qk_nope_head_dim,
+        "qk_pos_emb_head_dim": hf_config.qk_rope_head_dim,
+        "v_head_dim": hf_config.v_head_dim,
+        "rotary_base": hf_config.rope_theta,
+        "rotary_scaling_factor": mla_rope_config["factor"],
+        "max_position_embeddings": mla_rope_config["original_max_position_embeddings"],
+        "beta_fast": mla_rope_config["beta_fast"],
+        "beta_slow": mla_rope_config["beta_slow"],
+        "mscale": mla_rope_config["mscale"],
+        "mscale_all_dim": mla_rope_config["mscale_all_dim"],
+        # Other optimizations
+        "persist_layer_norm": True,
+        "bias_activation_fusion": True,
+        "bias_dropout_fusion": True,
+    }
+    
+    # Update with any provided overrides
+    config_args.update(override_transformer_config_kwargs)
+    print(f"MLATransformerConfig init args: {config_args}")
+
+    transformer_config = MLATransformerConfig(**config_args)
 
     return transformer_config
 
